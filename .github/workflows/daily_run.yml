@@ -1,0 +1,31 @@
+name: Daily 11 PM PKT Mira Scanner
+
+on:
+  schedule:
+    # 18:00 UTC = 11:00 PM Karachi Time (UTC+5)
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-automation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install playwright requests
+          playwright install chromium
+
+      - name: Run Scraper
+        env:
+          AUTOWEB_USER: ${{ secrets.AUTOWEB_USER }}
+          AUTOWEB_PASS: ${{ secrets.AUTOWEB_PASS }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python scraper.py
