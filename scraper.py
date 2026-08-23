@@ -1,93 +1,81 @@
-import os
 import asyncio
+import os
 import requests
 from playwright.async_api import async_playwright
 
-AUTOWEB_USER = os.environ.get("AUTOWEB_USER")
-AUTOWEB_PASS = os.environ.get("AUTOWEB_PASS")
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+# Fetch secrets from environment variables
+AUTOWEB_USER = os.getenv("AUTOWEB_USER")
+AUTOWEB_PASS = os.getenv("AUTOWEB_PASS")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-TARGET_GRADES = ["4", "4.5", "5"]
-TARGET_COLORS = ["W19", "W25", "S28", "WHITE", "PEARL", "SILVER"]
-BACK_CAM_KEYWORDS = ["バック", "Bカメラ", "バックカメラ", "NAVI READY", "ナビ済", "BACK CAM"]
-
-def send_discord_alert(car):
-    embed = {
-        "title": "🚨 Matched Daihatsu Mira Found!",
-        "description": "A new vehicle matching your specs was listed on AutoWeb Direct.",
-        "color": 3066993,  # Green
-        "fields": [
-            {"name": "📌 Lot Number", "value": str(car['lot']), "inline": True},
-            {"name": "🏛️ Auction House", "value": str(car['auction']), "inline": True},
-            {"name": "📅 Year", "value": str(car['year']), "inline": True},
-            {"name": "🛣️ Mileage", "value": str(car['mileage']), "inline": True},
-            {"name": "🎨 Color Code", "value": str(car['color']), "inline": True},
-            {"name": "⭐ Auction Grade", "value": f"Grade {car['grade']}", "inline": True},
-            {"name": "📷 Camera Status", "value": "Factory Back Camera Confirmed", "inline": False},
-            {"name": "🔗 Auction Link", "value": f"[View Lot Details]({car['url']})", "inline": False}
-        ],
-        "footer": {"text": "AutoWeb Direct Automated Scanner • Daily 11 PM PKT Run"}
-    }
+def send_discord_alert(message):
+    """Sends a text notification to the configured Discord channel."""
+    if not DISCORD_WEBHOOK_URL:
+        print("[!] DISCORD_WEBHOOK_URL environment variable is not set.")
+        return
     
-    payload = {
-        "username": "Mira Auction Bot",
-        "avatar_url": "https://i.imgur.com/4M34hi2.png",
-        "embeds": [embed]
-    }
-    
-    requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    payload = {"content": message}
+    response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    if response.status_code == 204 or response.status_code == 200:
+        print("[+] Discord notification sent successfully.")
+    else:
+        print(f"[!] Failed to send Discord notification: {response.status_code} - {response.text}")
 
 async def main():
+    if not AUTOWEB_USER or not AUTOWEB_PASS:
+        print("[!] Missing login credentials in environment variables.")
+        return
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
 
-        # 1. Login to AutoWeb Direct
-        await page.goto("https://autowebdirect.com/spn/")
-        await page.fill("input[name='login']", AUTOWEB_USER)
-        await page.fill("input[name='password']", AUTOWEB_PASS)
-        await page.click("input[type='submit']")
+        print("[*] Navigating to target site...")
+        await page.goto("https://autowebdirect.com", wait_until="domcontentloaded")
+
+        # Flexible selector handling to prevent locator timeouts
+        print("[*] Locating username/email input field...")
+        username_selector = "input[type='email'], input[name='username'], input[name='email'], input[name='login'], #username, #email"
+        await page.wait_for_selector(username_selector, timeout=20000)
+        username_input = page.locator(username_selector).first
+        await username_input.fill(AUTOWEB_USER)
+
+        print("[*] Locating password input field...")
+        password_selector = "input[type='password'], input[name='password'], #password"
+        await page.wait_for_selector(password_selector, timeout=20000)
+        password_input = page.locator(password_selector).first
+        await password_input.fill(AUTOWEB_PASS)
+
+        # Submit form
+        print("[*] Submitting login credentials...")
+        submit_button = page.locator("button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign In')").first
+        await submit_button.click()
+
+        # Wait for navigation or post-login state
         await page.wait_for_load_state("networkidle")
+        print("[+] Login sequence executed.")
 
-        # 2. Search Japan Auctions Frame
-        await page.goto("https://auc.autowebdirect.com/japan")
-        await page.select_option("select#make", label="DAIHATSU")
-        await page.select_option("select#model", label="MIRA E S")
-        await page.select_option("select#year_from", value="2022")
-        await page.select_option("select#year_to", value="2025")
-        await page.fill("input#mileage_from", "2000")
-        await page.fill("input#mileage_to", "20000")
-        
-        await page.click("#search_btn")
-        await page.wait_for_selector(".car_table_row", timeout=15000)
+        # --- SCRAPING & ALERT LOGIC HERE ---
+        print("[*] Navigating to stock page...")
+        await page.goto("https://autowebdirect.com/stock", wait_until="networkidle")
 
-        # 3. Filter Results
-        rows = await page.query_selector_all(".car_table_row")
-        for row in rows:
-            color = (await (await row.query_selector(".col_color")).inner_text()).upper()
-            grade = await (await row.query_selector(".col_grade")).inner_text()
-            
-            if grade in TARGET_GRADES and any(c in color for c in TARGET_COLORS):
-                lot_no = await (await row.query_selector(".col_lot")).inner_text()
-                auction = await (await row.query_selector(".col_auction")).inner_text()
+        cars = await page.locator(".car-card, .vehicle-row, .auction-item").all()
+        found_count = 0
+
+        for car in cars:
+            text = await car.inner_text()
+            if "MIRA" in text.upper():
+                found_count += 1
+                link_element = car.locator("a").first
+                link = await link_element.get_attribute("href") if await link_element.count() > 0 else ""
                 
-                # Check Auction Sheet Details
-                detail_page = await context.new_page()
-                await detail_page.goto(f"https://autowebdirect.com/spn/lot_detail?lot={lot_no}")
-                sheet_text = await detail_page.inner_text("body")
-                
-                if any(kw in sheet_text.upper() for kw in BACK_CAM_KEYWORDS):
-                    send_discord_alert({
-                        "lot": lot_no,
-                        "auction": auction,
-                        "year": await (await row.query_selector(".col_year")).inner_text(),
-                        "mileage": await (await row.query_selector(".col_mileage")).inner_text(),
-                        "color": color,
-                        "grade": grade,
-                        "url": detail_page.url
-                    })
-                await detail_page.close()
+                alert_msg = f"🚗 **Mira Found!**\nDetails: {text.strip()[:150]}...\nLink: https://autowebdirect.com{link}"
+                send_discord_alert(alert_msg)
+
+        if found_count == 0:
+            print("[*] No new Mira listings detected.")
+            send_discord_alert("ℹ️ Daily scan finished: No new Mira listings found today.")
 
         await browser.close()
 
