@@ -1,13 +1,12 @@
 import asyncio
+import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
-from playwright.async_api import (
-    async_playwright,
-    TimeoutError as PlaywrightTimeoutError,
-)
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 
 # ============================================================
@@ -15,125 +14,130 @@ from playwright.async_api import (
 # ============================================================
 
 BASE_URL = os.getenv(
-    "AUTOWEB_BASE_URL",
-    "https://autowebdirect.com/",
+    "AUCTION_URL",
+    "https://auc.alubaidmotors.com/japan",
 )
 
-STOCK_URL = os.getenv(
-    "AUTOWEB_STOCK_URL",
-    "https://autowebdirect.com/stock",
-)
-
-AUTOWEB_USER = os.getenv("AUTOWEB_USER")
-AUTOWEB_PASS = os.getenv("AUTOWEB_PASS")
+USERNAME = os.getenv("USERNAME")
+PASSWORD = os.getenv("PASSWORD")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 
+# The user specifically requested at least one minute after
+# pressing GET IMAGES.
+IMAGE_WAIT_SECONDS = int(os.getenv("IMAGE_WAIT_SECONDS", "60"))
+IMAGE_RETRIES = int(os.getenv("IMAGE_RETRIES", "2"))
+
 DEBUG_DIR = Path("playwright-debug")
 DEBUG_DIR.mkdir(exist_ok=True)
+
+STATE_FILE = Path("mira_seen.json")
+
+MIRA_RE = re.compile(r"\b(?:DAIHATSU\s+)?MIRA\b", re.I)
+GET_IMAGES_RE = re.compile(r"GET\s+IMAGES?", re.I)
+
+LOGIN_ERROR_WORDS = [
+    "incorrect password",
+    "invalid password",
+    "invalid username",
+    "incorrect username",
+    "login failed",
+    "authentication failed",
+    "user not found",
+]
 
 
 # ============================================================
 # DISCORD
 # ============================================================
 
-def send_discord_alert(message: str) -> None:
-    """Send a message to Discord."""
+def send_discord_alert(message: str) -> bool:
     if not DISCORD_WEBHOOK_URL:
         print("[!] DISCORD_WEBHOOK_URL is not configured.")
-        return
+        return False
 
     try:
         response = requests.post(
             DISCORD_WEBHOOK_URL,
             json={"content": message},
-            timeout=15,
+            timeout=20,
         )
 
         if response.status_code in (200, 204):
             print("[+] Discord notification sent.")
-        else:
-            print(
-                f"[!] Discord notification failed: "
-                f"{response.status_code} - {response.text[:500]}"
-            )
+            return True
+
+        print(
+            f"[!] Discord notification failed: "
+            f"{response.status_code} - {response.text[:500]}"
+        )
+        return False
 
     except requests.RequestException as exc:
         print(f"[!] Discord request failed: {exc}")
+        return False
 
 
 # ============================================================
 # DEBUGGING
 # ============================================================
 
-async def save_debug_files(page, name: str = "failure") -> None:
-    """
-    Save screenshot and HTML when something goes wrong.
-    These files are extremely useful in GitHub Actions.
-    """
+async def save_debug_files(page, name: str) -> None:
     try:
-        screenshot_path = DEBUG_DIR / f"{name}.png"
-        html_path = DEBUG_DIR / f"{name}.html"
-
         await page.screenshot(
-            path=str(screenshot_path),
+            path=str(DEBUG_DIR / f"{name}.png"),
             full_page=True,
         )
-
-        html = await page.content()
-        html_path.write_text(html, encoding="utf-8")
-
-        print(f"[+] Debug screenshot: {screenshot_path}")
-        print(f"[+] Debug HTML: {html_path}")
-
+        (DEBUG_DIR / f"{name}.html").write_text(
+            await page.content(),
+            encoding="utf-8",
+        )
+        print(f"[+] Debug files saved: {name}")
     except Exception as exc:
         print(f"[!] Could not save debug files: {exc}")
 
 
 async def print_page_debug_info(page) -> None:
-    """Print useful information about the current page."""
-    print()
-    print("========== PAGE DEBUG ==========")
-    print(f"URL:   {page.url}")
-
+    print("\n========== PAGE DEBUG ==========")
+    print(f"URL: {page.url}")
     try:
         print(f"TITLE: {await page.title()}")
     except Exception:
         pass
 
     try:
-        inputs = page.locator("input")
-        count = await inputs.count()
+        body = await page.locator("body").inner_text()
+        print(f"BODY TEXT LENGTH: {len(body)}")
+        print(body[:5000])
+    except Exception as exc:
+        print(f"[!] Could not read body: {exc}")
 
-        print(f"INPUT COUNT: {count}")
+    try:
+        buttons = page.locator("button, input[type='button'], input[type='submit'], a")
+        count = min(await buttons.count(), 100)
+        print(f"VISIBLE CONTROLS TO INSPECT: {count}")
 
         for i in range(count):
-            element = inputs.nth(i)
-
+            el = buttons.nth(i)
             try:
-                input_type = await element.get_attribute("type")
-                name = await element.get_attribute("name")
-                element_id = await element.get_attribute("id")
-                placeholder = await element.get_attribute("placeholder")
-                value = await element.get_attribute("value")
-
-                print(
-                    f"INPUT {i}: "
-                    f"type={input_type!r}, "
-                    f"name={name!r}, "
-                    f"id={element_id!r}, "
-                    f"placeholder={placeholder!r}, "
-                    f"value={value!r}"
-                )
+                if not await el.is_visible():
+                    continue
+                text = (await el.inner_text()).strip()
+                value = await el.get_attribute("value")
+                aria = await el.get_attribute("aria-label")
+                href = await el.get_attribute("href")
+                if text or value or aria or href:
+                    print(
+                        f"CONTROL {i}: text={text!r} value={value!r} "
+                        f"aria={aria!r} href={href!r}"
+                    )
             except Exception:
-                pass
-
+                continue
     except Exception as exc:
-        print(f"[!] Could not inspect inputs: {exc}")
+        print(f"[!] Could not inspect controls: {exc}")
 
-    print("================================")
-    print()
+    print("================================\n")
 
 
 # ============================================================
@@ -141,14 +145,6 @@ async def print_page_debug_info(page) -> None:
 # ============================================================
 
 async def find_username_input(page):
-    """
-    Find the User ID field.
-
-    AutoWeb Direct currently displays a generic User ID input,
-    so we cannot rely only on input[type=email] or name=username.
-    """
-
-    # First try conventional selectors.
     selectors = [
         "input[name='username']",
         "input[name='user']",
@@ -161,17 +157,13 @@ async def find_username_input(page):
     ]
 
     for selector in selectors:
-        locator = page.locator(selector).first
-
         try:
-            if await locator.count() > 0 and await locator.is_visible():
-                print(f"[+] Username selector found: {selector}")
-                return locator
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                return loc
         except Exception:
-            continue
+            pass
 
-    # Fallback:
-    # Find the first visible text-like input that is NOT the password.
     inputs = page.locator(
         "input:not([type='hidden']):not([type='password']):"
         "not([type='checkbox']):not([type='radio']):"
@@ -179,47 +171,34 @@ async def find_username_input(page):
         "not([type='image'])"
     )
 
-    count = await inputs.count()
-
-    for i in range(count):
-        locator = inputs.nth(i)
-
+    for i in range(await inputs.count()):
+        loc = inputs.nth(i)
         try:
-            if await locator.is_visible():
-                print(f"[+] Username field found using generic input #{i}")
-                return locator
+            if await loc.is_visible():
+                return loc
         except Exception:
-            continue
+            pass
 
     return None
 
 
 async def find_password_input(page):
-    """Find the password field."""
-
-    selectors = [
+    for selector in [
         "input[type='password']",
         "input[name='password']",
         "input[id='password']",
         "input[placeholder*='Password' i]",
-    ]
-
-    for selector in selectors:
-        locator = page.locator(selector).first
-
+    ]:
         try:
-            if await locator.count() > 0 and await locator.is_visible():
-                print(f"[+] Password selector found: {selector}")
-                return locator
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                return loc
         except Exception:
-            continue
-
+            pass
     return None
 
 
 async def find_login_button(page):
-    """Find the login/submit control."""
-
     selectors = [
         "button[type='submit']",
         "input[type='submit']",
@@ -233,368 +212,529 @@ async def find_login_button(page):
     ]
 
     for selector in selectors:
-        locator = page.locator(selector).first
-
         try:
-            if await locator.count() > 0 and await locator.is_visible():
-                print(f"[+] Login button found: {selector}")
-                return locator
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible():
+                return loc
         except Exception:
-            continue
+            pass
 
-    # Last-resort fallback: find a form containing a password input
-    # and use its submit/input control.
     password = page.locator("input[type='password']").first
-
-    if await password.count() > 0:
-        try:
+    try:
+        if await password.count():
             form = password.locator("xpath=ancestor::form[1]")
-
-            if await form.count() > 0:
+            if await form.count():
                 submit = form.locator(
                     "button, input[type='submit'], input[type='image']"
                 ).first
-
-                if await submit.count() > 0 and await submit.is_visible():
-                    print("[+] Login button found inside login form.")
+                if await submit.count() and await submit.is_visible():
                     return submit
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     return None
 
 
-async def login(page) -> bool:
-    """Log into AutoWeb Direct."""
+async def login_if_needed(page) -> bool:
+    print(f"[*] Opening auction website: {BASE_URL}")
 
-    print("[*] Navigating to AutoWeb Direct...")
+    try:
+        response = await page.goto(
+            BASE_URL,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        await page.wait_for_timeout(2500)
+        print(f"[*] Current URL: {page.url}")
+        if response:
+            print(f"[*] HTTP status: {response.status}")
+    except Exception as exc:
+        print(f"[!] Could not open auction site: {exc}")
+        await save_debug_files(page, "site_open_failed")
+        return False
 
-    await page.goto(
-        BASE_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
+    # If the page is already authenticated, continue without login.
+    try:
+        body = (await page.locator("body").inner_text()).lower()
+    except Exception:
+        body = ""
 
-    # Give the site's JavaScript a short chance to initialize.
-    await page.wait_for_timeout(1500)
+    if not any(word in body for word in ("login", "user id", "password")):
+        print("[+] Page appears to be already authenticated.")
+        return True
 
-    print(f"[*] Current URL: {page.url}")
-
-    # The live page has a User ID + Password form.
-    print("[*] Locating User ID field...")
+    if not USERNAME or not PASSWORD:
+        print(
+            "[!] Login appears to be required, but AUTOWEB_USER/"
+            "AUTOWEB_PASS are missing."
+        )
+        await save_debug_files(page, "login_required")
+        return False
 
     username_input = await find_username_input(page)
-
-    if username_input is None:
-        print("[!] Could not find User ID field.")
-        await print_page_debug_info(page)
-        await save_debug_files(page, "login_username_not_found")
-        return False
-
-    print("[*] Filling User ID...")
-    await username_input.fill(AUTOWEB_USER)
-
-    print("[*] Locating password field...")
-
     password_input = await find_password_input(page)
-
-    if password_input is None:
-        print("[!] Could not find password field.")
-        await print_page_debug_info(page)
-        await save_debug_files(page, "login_password_not_found")
-        return False
-
-    print("[*] Filling password...")
-    await password_input.fill(AUTOWEB_PASS)
-
-    print("[*] Locating login button...")
-
     login_button = await find_login_button(page)
 
-    if login_button is None:
-        print("[!] Could not find login button.")
+    if not username_input or not password_input or not login_button:
+        print("[!] Could not identify the login form.")
         await print_page_debug_info(page)
-        await save_debug_files(page, "login_button_not_found")
+        await save_debug_files(page, "login_form_not_found")
         return False
 
+    await username_input.fill(USERNAME)
+    await password_input.fill(PASSWORD)
+
     print("[*] Submitting login...")
+    try:
+        await login_button.click()
+    except Exception as exc:
+        print(f"[!] Login click failed: {exc}")
+        await save_debug_files(page, "login_click_failed")
+        return False
 
-    old_url = page.url
+    await page.wait_for_timeout(4000)
 
     try:
-        async with page.expect_navigation(
-            wait_until="domcontentloaded",
-            timeout=15000,
-        ):
-            await login_button.click()
-
-    except PlaywrightTimeoutError:
-        # Some older sites submit/login using JavaScript without
-        # triggering a normal navigation. That is not automatically
-        # a failure.
-        print("[!] No normal navigation detected after login click.")
-
-        try:
-            await login_button.click(timeout=5000)
-        except Exception:
-            pass
-
-    await page.wait_for_timeout(2500)
-
-    print(f"[*] URL after login: {page.url}")
-
-    # Check for obvious login errors.
-    body_text = ""
-
-    try:
-        body_text = (await page.locator("body").inner_text()).lower()
+        body = (await page.locator("body").inner_text()).lower()
     except Exception:
-        pass
+        body = ""
 
-    login_error_words = [
-        "incorrect password",
-        "invalid password",
-        "invalid username",
-        "incorrect username",
-        "login failed",
-        "authentication failed",
-        "user not found",
-    ]
-
-    for error_text in login_error_words:
-        if error_text in body_text:
-            print(f"[!] Login appears to have failed: {error_text}")
+    for word in LOGIN_ERROR_WORDS:
+        if word in body:
+            print(f"[!] Login failed: {word}")
             await save_debug_files(page, "login_failed")
             return False
 
-    # If URL changed, that's a useful sign.
-    if page.url != old_url:
-        print("[+] Login caused a navigation.")
-
-    # Check whether the password field disappeared.
-    password_still_visible = False
-
     try:
-        password_still_visible = await page.locator(
-            "input[type='password']"
-        ).first.is_visible()
+        if await page.locator("input[type='password']").first.is_visible():
+            print("[!] Password field is still visible; login may have failed.")
+            await save_debug_files(page, "login_maybe_failed")
+            return False
     except Exception:
         pass
 
-    if password_still_visible:
-        print(
-            "[!] Password field is still visible. "
-            "Login may not have succeeded."
-        )
-
-        await print_page_debug_info(page)
-        await save_debug_files(page, "login_maybe_failed")
-
-        return False
-
-    print("[+] Login sequence completed.")
+    print("[+] Login completed.")
     return True
 
 
 # ============================================================
-# STOCK PAGE
+# MIRA DISCOVERY
 # ============================================================
 
-async def open_stock_page(page) -> bool:
-    """Open the stock page after authentication."""
+async def all_pages(context):
+    """Return pages and their frames so an iframe-based auction page is covered."""
+    pages = list(context.pages)
+    frames = []
+    for p in pages:
+        frames.extend(p.frames)
+    return pages, frames
 
-    print("[*] Opening stock page...")
-    print(f"[*] Stock URL: {STOCK_URL}")
+
+async def get_body_text(frame) -> str:
+    try:
+        return await frame.locator("body").inner_text(timeout=10000)
+    except Exception:
+        return ""
+
+
+async def find_mira_candidates(frame):
+    """
+    Find likely auction listing containers without assuming one specific
+    CSS class. We use MIRA text, then walk up the DOM until a useful
+    container/link is found.
+    """
+    candidates = []
+    seen = set()
 
     try:
-        response = await page.goto(
-            STOCK_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        matches = frame.get_by_text(MIRA_RE)
+        count = await matches.count()
+    except Exception:
+        count = 0
+        matches = None
 
-        await page.wait_for_timeout(2000)
+    print(f"[*] MIRA text matches in frame: {count}")
 
-        print(f"[*] Stock page URL: {page.url}")
-
-        if response:
-            print(f"[*] Stock HTTP status: {response.status}")
-
-            if response.status >= 400:
-                print(
-                    f"[!] Stock page returned HTTP {response.status}"
-                )
-
-        # Detect if the site redirected us back to login.
-        body_text = ""
-
+    for i in range(min(count, 300)):
         try:
-            body_text = (await page.locator("body").inner_text()).lower()
-        except Exception:
-            pass
+            match = matches.nth(i)
+            if not await match.is_visible():
+                continue
 
-        if "login to your account" in body_text:
-            print("[!] We appear to be back on the login page.")
-            return False
+            # Try several ancestor levels. The first useful ancestor is
+            # normally the auction row/card/table row.
+            ancestor = match
+            for level in range(1, 9):
+                ancestor = ancestor.locator("xpath=..")
 
-        return True
+                if not await ancestor.count():
+                    break
 
-    except Exception as exc:
-        print(f"[!] Failed to open stock page: {exc}")
-        await save_debug_files(page, "stock_navigation_failed")
-        return False
+                text = " ".join((await ancestor.inner_text()).split())
+                if not text or len(text) < 20:
+                    continue
+
+                # Prefer an ancestor containing a listing link or
+                # auction-specific information.
+                link_count = await ancestor.locator("a[href]").count()
+                if link_count or len(text) >= 80 or level >= 4:
+                    try:
+                        href = ""
+                        if link_count:
+                            href = await ancestor.locator("a[href]").first.get_attribute(
+                                "href"
+                            ) or ""
+
+                        absolute = urljoin(frame.url, href) if href else ""
+
+                        # Keep the candidate bounded; huge ancestors are
+                        # page-level containers, not individual cars.
+                        if len(text) <= 2000:
+                            key = f"{absolute}|{text[:500]}"
+                            if key not in seen:
+                                seen.add(key)
+                                candidates.append(
+                                    {
+                                        "locator": ancestor,
+                                        "text": text,
+                                        "href": absolute,
+                                    }
+                                )
+                                break
+                    except Exception:
+                        pass
+
+        except Exception as exc:
+            print(f"[!] Candidate error #{i}: {exc}")
+
+    return candidates
+
+
+def looks_like_mira(text: str) -> bool:
+    return bool(MIRA_RE.search(text or ""))
+
+
+def normalize_details(text: str) -> str:
+    text = " ".join((text or "").split())
+    if len(text) > 1200:
+        text = text[:1200] + "..."
+    return text
 
 
 # ============================================================
-# SCRAPING
+# GET IMAGES / IMAGE VERIFICATION
 # ============================================================
 
-async def scrape_mira_listings(page) -> int:
-    """
-    Find vehicle listings containing 'MIRA'.
+async def count_loaded_images(scope) -> int:
+    try:
+        imgs = scope.locator("img")
+        count = await imgs.count()
+        loaded = 0
 
-    Multiple selectors are tried because the site's markup may change.
-    """
+        for i in range(min(count, 300)):
+            img = imgs.nth(i)
+            try:
+                if not await img.is_visible():
+                    continue
 
+                complete = await img.evaluate(
+                    "(el) => el.complete && el.naturalWidth > 0"
+                )
+                src = await img.get_attribute("src")
+                if complete and src:
+                    loaded += 1
+            except Exception:
+                continue
+
+        return loaded
+    except Exception:
+        return 0
+
+
+async def find_get_images(scope):
+    """
+    Locate the green GET IMAGES control shown in the user's screenshot.
+    We intentionally use several text/attribute strategies because the
+    website may render it as a button, link, input, or JS control.
+    """
     selectors = [
-        ".car-card",
-        ".vehicle-row",
-        ".auction-item",
-        ".vehicle",
-        ".car",
-        "tr",
-        "article",
+        "button",
+        "a",
+        "input[type='button']",
+        "input[type='submit']",
+        "[role='button']",
+        "*",
     ]
 
-    cars = None
-
     for selector in selectors:
-        locator = page.locator(selector)
-
         try:
-            count = await locator.count()
+            loc = scope.locator(selector)
+            count = await loc.count()
 
-            if count > 0:
-                print(
-                    f"[+] Found {count} elements using {selector}"
-                )
-                cars = locator
-                break
+            for i in range(min(count, 500)):
+                el = loc.nth(i)
+                try:
+                    if not await el.is_visible():
+                        continue
 
+                    text = " ".join((await el.inner_text()).split())
+                    value = await el.get_attribute("value") or ""
+                    aria = await el.get_attribute("aria-label") or ""
+                    title = await el.get_attribute("title") or ""
+
+                    combined = f"{text} {value} {aria} {title}"
+
+                    if GET_IMAGES_RE.search(combined):
+                        return el
+                except Exception:
+                    continue
         except Exception:
             continue
 
-    if cars is None:
-        print("[!] No known vehicle containers found.")
+    return None
 
-        # Fallback: inspect the entire page for MIRA.
-        body_text = await page.locator("body").inner_text()
 
-        if "MIRA" in body_text.upper():
+async def wait_for_images(scope, minimum_images=1) -> int:
+    deadline = asyncio.get_running_loop().time() + IMAGE_WAIT_SECONDS
+
+    while asyncio.get_running_loop().time() < deadline:
+        loaded = await count_loaded_images(scope)
+        if loaded >= minimum_images:
+            print(f"[+] Images loaded: {loaded}")
+            return loaded
+
+        await asyncio.sleep(5)
+
+    loaded = await count_loaded_images(scope)
+    print(f"[*] Image wait finished. Loaded images: {loaded}")
+    return loaded
+
+
+async def load_listing_images(scope, listing_number: int) -> tuple[int, bool]:
+    """
+    If GET IMAGES is visible, click it and wait at least 60 seconds.
+    If it remains visible / images are still absent, retry.
+    """
+    loaded = await count_loaded_images(scope)
+
+    if loaded > 0:
+        print(
+            f"[+] Listing #{listing_number}: images already loaded ({loaded})."
+        )
+        return loaded, True
+
+    for attempt in range(1, IMAGE_RETRIES + 1):
+        button = await find_get_images(scope)
+
+        if button is None:
+            # No button. Give the page a short chance to load images
+            # without clicking anything.
             print(
-                "[!] 'MIRA' exists on the page, "
-                "but no vehicle container selector matched."
+                f"[*] Listing #{listing_number}: GET IMAGES button not visible."
             )
-            await save_debug_files(page, "mira_container_not_found")
+            loaded = await wait_for_images(scope, minimum_images=1)
+            return loaded, loaded > 0
 
-        return 0
-
-    found_count = 0
-    seen_links = set()
-
-    count = await cars.count()
-
-    for i in range(count):
-        car = cars.nth(i)
+        print(
+            f"[*] Listing #{listing_number}: clicking GET IMAGES "
+            f"(attempt {attempt}/{IMAGE_RETRIES})..."
+        )
 
         try:
-            text = (await car.inner_text()).strip()
+            await button.scroll_into_view_if_needed()
+            await button.click(timeout=15000)
+        except Exception as exc:
+            print(f"[!] GET IMAGES click failed: {exc}")
+            await asyncio.sleep(3)
+            continue
 
-            if not text:
+        # REQUIRED: at least one minute after pressing the button.
+        print(
+            f"[*] Waiting at least {IMAGE_WAIT_SECONDS} seconds for "
+            "auction images..."
+        )
+        await asyncio.sleep(IMAGE_WAIT_SECONDS)
+
+        loaded = await count_loaded_images(scope)
+        print(f"[*] Images after attempt {attempt}: {loaded}")
+
+        if loaded > 0:
+            return loaded, True
+
+    return loaded, loaded > 0
+
+
+# ============================================================
+# LISTING LINK / ID
+# ============================================================
+
+async def extract_listing_key(candidate) -> str:
+    href = candidate.get("href", "")
+    text = candidate.get("text", "")
+
+    # Prefer a stable listing URL.
+    if href:
+        return href
+
+    # Otherwise use strong auction identifiers from text.
+    patterns = [
+        r"\b(?:lot|lot\s*number)\s*[:#-]?\s*([A-Z0-9-]+)",
+        r"\bchassis(?:\s*id|\s*no\.?)?\s*[:#-]?\s*([A-Z0-9-]+)",
+        r"\b([A-Z]{1,5}\d{3,}[A-Z0-9-]*)\b",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            return m.group(1).upper()
+
+    # Last-resort stable-ish hash.
+    import hashlib
+    return hashlib.sha256(text[:1000].encode("utf-8")).hexdigest()[:24]
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def load_seen() -> set[str]:
+    if not STATE_FILE.exists():
+        return set()
+
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return set(str(x) for x in data)
+        if isinstance(data, dict) and isinstance(data.get("seen"), list):
+            return set(str(x) for x in data["seen"])
+    except Exception as exc:
+        print(f"[!] Could not read state file: {exc}")
+
+    return set()
+
+
+def save_seen(seen: set[str]) -> None:
+    # Keep the file bounded so it doesn't grow forever.
+    values = sorted(seen)[-5000:]
+    STATE_FILE.write_text(
+        json.dumps(values, indent=2),
+        encoding="utf-8",
+    )
+
+
+# ============================================================
+# PROCESS MIRA LISTINGS
+# ============================================================
+
+async def process_candidates(page, frame, candidates, seen):
+    verified_scan = True
+    current_keys = set()
+    new_count = 0
+
+    for index, candidate in enumerate(candidates, start=1):
+        try:
+            text = candidate["text"]
+
+            if not looks_like_mira(text):
                 continue
 
-            if "MIRA" not in text.upper():
+            key = await extract_listing_key(candidate)
+            current_keys.add(key)
+
+            print("\n----------------------------------------")
+            print(f"[+] MIRA candidate #{index}")
+            print(f"KEY: {key}")
+            print(f"URL: {candidate.get('href', '')}")
+            print(f"DETAILS: {normalize_details(text)}")
+
+            # If we already know this listing, do not send it again.
+            # Still count it as a verified MIRA listing.
+            if key in seen:
+                print("[*] Already sent previously; skipping Discord alert.")
                 continue
 
-            found_count += 1
+            listing_scope = candidate["locator"]
 
-            # Find a link inside the listing.
-            link = ""
+            # Try image loading within the listing first.
+            image_count, image_ok = await load_listing_images(
+                listing_scope,
+                index,
+            )
 
-            links = car.locator("a")
-            link_count = await links.count()
+            # If the button/images live outside the small ancestor,
+            # try the full frame as a fallback.
+            if not image_ok:
+                print(
+                    "[*] Images not found inside candidate; checking page "
+                    "scope for GET IMAGES."
+                )
+                page_button = await find_get_images(frame)
+                if page_button is not None:
+                    try:
+                        await page_button.scroll_into_view_if_needed()
+                        await page_button.click(timeout=15000)
+                        print(
+                            f"[*] Waiting {IMAGE_WAIT_SECONDS} seconds "
+                            "after page-level GET IMAGES..."
+                        )
+                        await asyncio.sleep(IMAGE_WAIT_SECONDS)
+                        image_count = await count_loaded_images(frame)
+                        image_ok = image_count > 0
+                    except Exception as exc:
+                        print(f"[!] Page-level image load failed: {exc}")
 
-            if link_count > 0:
-                href = await links.first.get_attribute("href")
+            if not image_ok:
+                verified_scan = False
+                print(
+                    f"[!] MIRA listing found but images could not be "
+                    f"verified: {key}"
+                )
 
-                if href:
-                    link = urljoin(page.url, href)
+            details = normalize_details(text)
+            link = candidate.get("href", "")
 
-            # Avoid duplicate Discord alerts.
-            unique_key = f"{text[:300]}|{link}"
-
-            if unique_key in seen_links:
-                continue
-
-            seen_links.add(unique_key)
-
-            details = " ".join(text.split())
-
-            if len(details) > 500:
-                details = details[:500] + "..."
-
-            alert_msg = (
-                "🚗 **Mira Found!**\n"
+            alert = (
+                "🚗 **NEW DAIHATSU MIRA FOUND!**\n"
                 f"**Details:** {details}\n"
+                f"**Images loaded:** {image_count}\n"
             )
 
             if link:
-                alert_msg += f"**Link:** {link}"
+                alert += f"**Auction link:** {link}\n"
 
-            print()
-            print("[+] MIRA LISTING FOUND")
-            print(details)
-            print(f"Link: {link}")
-            print()
+            if not image_ok:
+                alert += (
+                    "⚠️ **Image warning:** GET IMAGES was attempted, "
+                    "but no loaded auction image could be verified."
+                )
 
-            send_discord_alert(alert_msg)
+            send_discord_alert(alert)
+
+            # Mark as seen only after an alert was successfully attempted.
+            seen.add(key)
+            new_count += 1
 
         except Exception as exc:
-            print(f"[!] Error processing listing #{i}: {exc}")
+            verified_scan = False
+            print(f"[!] Error processing MIRA candidate: {exc}")
 
-    return found_count
+    return verified_scan, new_count, current_keys
 
 
 # ============================================================
-# MAIN
+# MAIN SCAN
 # ============================================================
 
-async def main() -> None:
-    print("========================================")
-    print(" AutoWeb Direct Mira Scraper")
-    print("========================================")
-
-    # Validate environment variables.
-    if not AUTOWEB_USER:
-        print("[!] AUTOWEB_USER is missing.")
-        return
-
-    if not AUTOWEB_PASS:
-        print("[!] AUTOWEB_PASS is missing.")
-        return
-
-    if not DISCORD_WEBHOOK_URL:
-        print(
-            "[!] Warning: DISCORD_WEBHOOK_URL is missing. "
-            "Scraping will continue without Discord alerts."
-        )
+async def run_scan() -> None:
+    seen = load_seen()
 
     async with async_playwright() as p:
-
         browser = None
 
         try:
-            print("[*] Starting Chromium...")
+            print("========================================")
+            print(" Al Ubaid Japan DAIHATSU MIRA Scanner")
+            print("========================================")
 
             browser = await p.chromium.launch(
                 headless=HEADLESS,
@@ -607,98 +747,113 @@ async def main() -> None:
             )
 
             context = await browser.new_context(
-                viewport={
-                    "width": 1440,
-                    "height": 900,
-                },
+                viewport={"width": 1440, "height": 900},
                 locale="en-US",
                 timezone_id="Asia/Tokyo",
             )
 
             page = await context.new_page()
-
-            # Reasonable default timeout.
             page.set_default_timeout(30000)
             page.set_default_navigation_timeout(60000)
 
-            # Log useful browser errors.
             page.on(
                 "console",
-                lambda msg: print(
-                    f"[browser:{msg.type}] {msg.text}"
-                ),
+                lambda msg: print(f"[browser:{msg.type}] {msg.text}"),
             )
-
             page.on(
                 "pageerror",
-                lambda exc: print(
-                    f"[browser page error] {exc}"
-                ),
+                lambda exc: print(f"[browser page error] {exc}"),
             )
 
-            # ------------------------------------------------
-            # LOGIN
-            # ------------------------------------------------
-
-            logged_in = await login(page)
-
-            if not logged_in:
-                print("[!] Login failed.")
+            if not await login_if_needed(page):
                 send_discord_alert(
-                    "⚠️ AutoWeb scraper: login failed. "
-                    "Check GitHub Actions debug artifacts."
+                    "🚨 **MIRA scanner:** could not open/authenticate "
+                    "the Al Ubaid Japan auction page. "
+                    "This scan was NOT verified."
                 )
                 return
 
-            # ------------------------------------------------
-            # STOCK
-            # ------------------------------------------------
+            # The auction site may use the main page or an iframe.
+            pages, frames = await all_pages(context)
 
-            stock_opened = await open_stock_page(page)
+            all_candidates = []
+            for frame in frames:
+                print(f"[*] Scanning frame: {frame.url}")
+                candidates = await find_mira_candidates(frame)
+                all_candidates.extend((frame, c) for c in candidates)
 
-            if not stock_opened:
-                print("[!] Could not open authenticated stock page.")
+            # Deduplicate candidates by URL/text.
+            unique = []
+            dedupe = set()
 
+            for frame, candidate in all_candidates:
+                key = (
+                    candidate.get("href", ""),
+                    candidate.get("text", "")[:500],
+                )
+                if key in dedupe:
+                    continue
+                dedupe.add(key)
+                unique.append((frame, candidate))
+
+            print(f"[*] Unique MIRA candidates: {len(unique)}")
+
+            if not unique:
+                # Before declaring zero, save diagnostics. This is critical
+                # because the old scraper incorrectly treated selector
+                # failure as "no cars".
                 await print_page_debug_info(page)
-                await save_debug_files(
-                    page,
-                    "stock_page_failed",
-                )
+                await save_debug_files(page, "mira_scan_no_candidates")
 
+                # We cannot confidently call this a verified zero if the
+                # page structure could not be discovered.
                 send_discord_alert(
-                    "⚠️ AutoWeb scraper: login succeeded or partially "
-                    "succeeded, but the stock page could not be opened."
+                    "⚠️ **MIRA scan could not be verified.**\n"
+                    "The Al Ubaid Japan page was opened, but the scanner "
+                    "could not identify any MIRA listing containers. "
+                    "It did NOT report this as 'No new MIRA listing'.\n"
+                    "Check the GitHub Actions debug screenshot/HTML."
                 )
-
                 return
 
-            # ------------------------------------------------
-            # SCRAPE
-            # ------------------------------------------------
+            verified = True
+            new_count = 0
 
-            print("[*] Searching for MIRA listings...")
-
-            found_count = await scrape_mira_listings(page)
-
-            if found_count == 0:
-                print("[*] No MIRA listings found.")
-                send_discord_alert(
-                    "ℹ️ Daily AutoWeb scan finished: "
-                    "No new MIRA listings found."
+            # Process each frame's candidates.
+            for frame, candidate in unique:
+                ok, added, _ = await process_candidates(
+                    page,
+                    frame,
+                    [candidate],
+                    seen,
                 )
-            else:
-                print(
-                    f"[+] Scan complete. "
-                    f"Found {found_count} MIRA listing(s)."
+                verified = verified and ok
+                new_count += added
+
+            if verified:
+                save_seen(seen)
+
+            if new_count == 0 and verified:
+                send_discord_alert(
+                    "ℹ️ **Daily MIRA scan completed.**\n"
+                    "No new MIRA listing found."
+                )
+            elif new_count > 0:
+                save_seen(seen)
+                print(f"[+] New MIRA listings sent to Discord: {new_count}")
+
+            if not verified:
+                send_discord_alert(
+                    "⚠️ **MIRA scan completed with warnings.**\n"
+                    "At least one MIRA listing was found, but image loading "
+                    "could not be fully verified."
                 )
 
         except Exception as exc:
-            print()
             print("========================================")
-            print("[!] SCRAPER FAILED")
+            print("[!] SCANNER FAILED")
             print("========================================")
             print(f"{type(exc).__name__}: {exc}")
-            print()
 
             try:
                 await print_page_debug_info(page)
@@ -707,19 +862,16 @@ async def main() -> None:
                 pass
 
             send_discord_alert(
-                "🚨 AutoWeb scraper crashed.\n"
-                f"Error: {type(exc).__name__}: {str(exc)[:500]}"
+                "🚨 **MIRA scanner crashed.**\n"
+                f"Error: {type(exc).__name__}: {str(exc)[:700]}"
             )
 
             raise
 
         finally:
             if browser:
-                print("[*] Closing browser...")
                 await browser.close()
-
-    print("[+] Scraper finished.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_scan())
